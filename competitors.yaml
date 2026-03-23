@@ -1,0 +1,58 @@
+competitors:
+  # Each entry defines one competitor to track.
+  # Optional Reddit fields let you tune the pricing/discussion searches per competitor.
+  #
+  # Field reference:
+  #   name                        — display name used in Slack reports
+  #   website                     — canonical domain (informational only)
+  #   homepage_url                — page to scrape for homepage changes
+  #   blog_url                    — page to scrape for new blog/news content
+  #   pricing_url                 — page to scrape for pricing changes (null = skip)
+  #   careers_url                 — page to scrape for new job postings (null = skip)
+  #   linkedin_company_id         — numeric LinkedIn company ID for ad + organic post scraping
+  #   linkedin_company_url        — LinkedIn company page URL (used for organic post targeting)
+  #   reddit_search               — base search phrase override (defaults to competitor name)
+  #   reddit_keywords             — extra query terms to combine with reddit_search
+  #   reddit_discussion_keywords  — keyword variants for customer/prospect discussion scan
+  #   reddit_include_subreddits   — subreddit allow-list (empty = search all)
+  #   reddit_exclude_subreddits   — subreddit block-list applied after allow-list
+
+  # --- Example: Full configuration (all fields) ---
+
+  - name: "Acme Support Co"
+    website: "https://www.acmesupport.example.com"
+    homepage_url: "https://www.acmesupport.example.com/"
+    blog_url: "https://www.acmesupport.example.com/blog"
+    pricing_url: "https://www.acmesupport.example.com/pricing"
+    careers_url: "https://www.acmesupport.example.com/careers"
+    linkedin_company_id: "12345678"
+    linkedin_company_url: "https://www.linkedin.com/company/12345678/"
+    reddit_search: "Acme Support outsourcing"
+    reddit_keywords: ["pricing", "cost", "quote", "how much", "monthly", "rate"]
+    reddit_discussion_keywords: ["review", "experience", "anyone used", "recommend", "worth it"]
+    reddit_exclude_subreddits: ["forhire", "jobs"]
+
+  # --- Example: Minimal configuration (no public pricing, no Reddit overrides) ---
+
+  - name: "TechDesk Pro"
+    website: "https://www.techdeskpro.example.com"
+    homepage_url: "https://www.techdeskpro.example.com/"
+    blog_url: "https://www.techdeskpro.example.com/resources"
+    pricing_url: null   # no public pricing page
+    careers_url: null
+    linkedin_company_id: "87654321"
+    linkedin_company_url: "https://www.linkedin.com/company/87654321/"
+    reddit_discussion_keywords: ["review", "experience", "anyone used", "recommend", "worth it"]
+
+  # --- Example: AI-native competitor (not on LinkedIn) ---
+
+  - name: "NovaBPO.ai"
+    website: "https://www.novabpo.example.ai"
+    homepage_url: "https://www.novabpo.example.ai/"
+    blog_url: "https://www.novabpo.example.ai/blog"
+    pricing_url: "https://www.novabpo.example.ai/pricing"
+    careers_url: null
+    linkedin_company_id: null   # not on LinkedIn
+    linkedin_company_url: null
+    reddit_discussion_keywords: ["review", "experience", "anyone used", "recommend", "worth it"]
+    reddit_include_subreddits: ["smallbusiness", "startups", "entrepreneur"]

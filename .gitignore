@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+
+# Runtime data (auth sessions, database, debug output)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
