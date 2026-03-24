@@ -13,10 +13,12 @@ Each weekly run:
 1. **Scrapes competitor websites** — homepage, blog/news, pricing, and careers pages. Detects meaningful content changes using SHA-256 hashing.
 2. **Scrapes LinkedIn** — new ads from the LinkedIn Ad Library and recent organic company posts.
 3. **Scrapes Reddit** — pricing discussions and customer/prospect sentiment threads.
-4. **Summarizes with Gemini** — each data source gets an AI summary; the run closes with an executive-level takeaways digest.
-5. **Posts to Slack** — a structured Slack digest with per-competitor sections and an executive summary.
+4. **Scrapes Twitter/X** — competitor tweets and third-party commentary *(via API Direct)*.
+5. **Scrapes Facebook** — competitor page posts, reviews, and third-party commentary *(via API Direct)*.
+6. **Summarizes with Gemini** — each data source gets an AI summary; the run closes with an executive-level takeaways digest.
+7. **Posts to Slack** — a structured Slack digest with per-competitor sections and an executive summary.
 
-All raw data is stored in SQLite for deduplication and change detection across runs.
+All raw data and summaries are stored in SQLite for deduplication, change detection, and historical trend analysis.
 
 ---
 
@@ -28,13 +30,14 @@ competitors.yaml
       ▼
   orchestrator.py
       │
-      ├── scrapers/website.py    ──► homepage, blog, pricing, careers
-      ├── scrapers/linkedin_ads.py ─► LinkedIn Ad Library + organic posts
-      └── scrapers/reddit_intel.py ─► Reddit pricing + discussion search
+      ├── scrapers/website.py      ──► homepage, blog, pricing, careers
+      ├── scrapers/linkedin_ads.py ──► LinkedIn Ad Library + organic posts
+      ├── scrapers/reddit_intel.py ──► Reddit pricing + discussion search
+      └── scrapers/apidirect.py    ──► Twitter, Facebook, Reddit fallback (API Direct)
       │
-      ├── database.py            ──► SQLite (change detection + dedup)
-      ├── summarizer.py          ──► Gemini API (per-source summaries)
-      └── reporter.py            ──► Slack Block Kit digest
+      ├── database.py              ──► SQLite (change detection + dedup + analytics)
+      ├── summarizer.py            ──► Gemini API (per-source summaries)
+      └── reporter.py              ──► Slack Block Kit digest
 ```
 
 ---
@@ -45,10 +48,18 @@ competitors.yaml
 - **LinkedIn Ad Library scraping** — no paid API required; uses Playwright with a saved session
 - **LinkedIn organic posts** — recent company posts scraped from the company page feed
 - **Reddit intelligence** — pricing discussions and customer voice threads, with per-competitor keyword tuning and subreddit filtering
+- **Twitter/X monitoring** — competitor's own tweets and third-party commentary (via API Direct)
+- **Facebook monitoring** — competitor page posts, reviews, and third-party commentary (via API Direct)
+- **Smart Reddit fallback** — when native Reddit scraping is blocked (403), automatically falls back to API Direct
 - **AI summaries** — Gemini Flash for per-source summaries; Gemini Pro (with extended thinking) for the executive digest
+- **Run tracking** — each execution gets a unique run ID; all per-competitor results are correlated
+- **Summary persistence** — every AI-generated summary is stored in SQLite, so you can replay past reports and analyze trends
 - **Error isolation** — a failure on one competitor or one source doesn't abort the rest of the run
 - **Coverage gaps** — when a source fails or is skipped, that gap is called out in the executive summary
 - **Slack chunking** — large digests are split automatically to stay within Slack's block limits
+- **Schema migrations** — database schema evolves safely with versioned migrations
+- **Auto-pruning** — old page snapshots (>180 days) and stale ads (>365 days) are cleaned up automatically
+- **API budget tracking** — API Direct usage is tracked per endpoint per month with configurable limits
 
 ---
 
@@ -58,6 +69,7 @@ competitors.yaml
 - A [Google Gemini API key](https://aistudio.google.com/app/apikey)
 - A [Slack incoming webhook URL](https://api.slack.com/messaging/webhooks)
 - A LinkedIn account (for LinkedIn scraping — a dedicated dummy account is recommended)
+- *(Optional)* An [API Direct key](https://apidirect.io) for Twitter, Facebook, and Reddit fallback
 
 ---
 
@@ -66,7 +78,7 @@ competitors.yaml
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-username/competitor-tracker.git
+git clone https://github.com/scotthirebloom/competitor-tracker.git
 cd competitor-tracker
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
@@ -80,14 +92,14 @@ cp .env.example .env
 # Edit .env and fill in your API keys
 ```
 
-Required variables:
-
-| Variable | Description |
-|---|---|
-| `GEMINI_API_KEY` | Google Gemini API key |
-| `SLACK_WEBHOOK_URL` | Slack incoming webhook URL |
-| `LINKEDIN_USERNAME` | *(optional)* LinkedIn email for auto re-login |
-| `LINKEDIN_PASSWORD` | *(optional)* LinkedIn password for auto re-login |
+| Variable | Required | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | yes | Google Gemini API key |
+| `SLACK_WEBHOOK_URL` | yes | Slack incoming webhook URL |
+| `LINKEDIN_USERNAME` | no | LinkedIn email for auto re-login |
+| `LINKEDIN_PASSWORD` | no | LinkedIn password for auto re-login |
+| `APIDIRECT_API_KEY` | no | API Direct key for Twitter/Facebook/Reddit fallback |
+| `APIDIRECT_MONTHLY_LIMIT` | no | Max requests per endpoint per month (default: 50) |
 
 ### 3. Add your competitors
 
@@ -108,6 +120,9 @@ Edit `competitors.yaml`. Each entry supports:
 | `reddit_discussion_keywords` | no | Terms for customer/prospect discussion scan |
 | `reddit_include_subreddits` | no | Subreddit allow-list (empty = all) |
 | `reddit_exclude_subreddits` | no | Subreddit block-list |
+| `facebook_page_id` | no | Facebook page slug/ID for posts + reviews |
+| `twitter_handle` | no | Twitter/X handle (without @) for tweet scraping |
+| `apidirect_keywords` | no | Override search terms for social commentary |
 
 See `competitors.yaml` for annotated examples.
 
@@ -211,19 +226,35 @@ launchctl start com.competitor-tracker
 
 ## Storage
 
-All data is stored in `data/state.db` (SQLite, gitignored).
+All data is stored in `data/state.db` (SQLite, gitignored). The schema is managed with versioned migrations that apply automatically on startup.
 
 | Table | Contents |
 |---|---|
 | `page_snapshots` | Versioned website content with SHA-256 hashes |
-| `ad_snapshots` | Deduped LinkedIn ads, organic posts, and Reddit intel |
-| `run_log` | Per-competitor run success/error history |
+| `ad_snapshots` | Deduped LinkedIn ads, organic posts, Reddit, Twitter, and Facebook intel |
+| `runs` | Top-level run tracking (start/end time, status, duration, executive summary) |
+| `run_log` | Per-competitor run outcomes with metrics (duration, counts, source coverage) |
+| `summaries` | Every AI-generated summary, queryable by competitor, type, and date |
+| `apidirect_usage` | Monthly API Direct request counts per endpoint |
+| `schema_migrations` | Applied migration versions for safe schema evolution |
 
-Quick inspection:
+### Querying historical data
 
 ```bash
-sqlite3 data/state.db ".tables"
-sqlite3 data/state.db "SELECT competitor_name, page_type, checked_at FROM page_snapshots ORDER BY id DESC LIMIT 20;"
+# Recent runs
+sqlite3 data/state.db "SELECT id, started_at, status, duration_seconds FROM runs ORDER BY id DESC LIMIT 5;"
+
+# All summaries from last run
+sqlite3 data/state.db "SELECT competitor_name, summary_type, length(summary_text) FROM summaries WHERE run_id = (SELECT MAX(id) FROM runs);"
+
+# Pricing changes for a competitor over time
+sqlite3 data/state.db "SELECT created_at, summary_text FROM summaries WHERE competitor_name = 'Acme' AND summary_type = 'pricing_change' ORDER BY created_at DESC;"
+
+# Weekly new ad counts
+sqlite3 data/state.db "SELECT strftime('%Y-W%W', first_seen_at) AS week, competitor_name, COUNT(*) FROM ad_snapshots GROUP BY week, competitor_name ORDER BY week DESC LIMIT 20;"
+
+# API Direct usage this month
+sqlite3 data/state.db "SELECT endpoint, request_count FROM apidirect_usage WHERE month = strftime('%Y-%m', 'now');"
 ```
 
 ---
@@ -237,7 +268,7 @@ Re-run `setup_auth.py` to generate a fresh session, or set `LINKEDIN_USERNAME`/`
 Run in `--debug` mode (non-headless). Avoid running too frequently. The tracker will continue other sources and report LinkedIn as a coverage gap.
 
 **Reddit empty results:**
-Widen `reddit_keywords` or remove subreddit filters in `competitors.yaml`. The scraper falls back to `old.reddit.com` automatically on transient failures.
+If native Reddit scraping is blocked (403), the tracker automatically falls back to API Direct if `APIDIRECT_API_KEY` is configured. You can also widen `reddit_keywords` or remove subreddit filters in `competitors.yaml`.
 
 **No changes detected:**
 This is expected when content hasn't changed since the last run. Verify by querying recent rows:
@@ -245,6 +276,9 @@ This is expected when content hasn't changed since the last run. Verify by query
 ```bash
 sqlite3 data/state.db "SELECT competitor_name, page_type, checked_at FROM page_snapshots ORDER BY id DESC LIMIT 10;"
 ```
+
+**API Direct budget exhausted:**
+The tracker tracks usage per endpoint per month. When the limit is reached, that source is skipped gracefully. Increase `APIDIRECT_MONTHLY_LIMIT` in `.env` or wait for the next month.
 
 ---
 

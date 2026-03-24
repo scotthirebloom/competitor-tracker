@@ -16,6 +16,9 @@ competitors:
   #   reddit_discussion_keywords  — keyword variants for customer/prospect discussion scan
   #   reddit_include_subreddits   — subreddit allow-list (empty = search all)
   #   reddit_exclude_subreddits   — subreddit block-list applied after allow-list
+  #   facebook_page_id            — Facebook page slug/ID for post + review scraping (optional)
+  #   twitter_handle              — Twitter/X handle without @ for tweet scraping (optional)
+  #   apidirect_keywords          — override search terms for social commentary (optional)
 
   # --- Example: Full configuration (all fields) ---
 
@@ -31,6 +34,9 @@ competitors:
     reddit_keywords: ["pricing", "cost", "quote", "how much", "monthly", "rate"]
     reddit_discussion_keywords: ["review", "experience", "anyone used", "recommend", "worth it"]
     reddit_exclude_subreddits: ["forhire", "jobs"]
+    facebook_page_id: "AcmeSupportCo"
+    twitter_handle: "acmesupport"
+    apidirect_keywords: ["Acme Support outsourcing", "Acme Support BPO"]
 
   # --- Example: Minimal configuration (no public pricing, no Reddit overrides) ---
 
@@ -43,6 +49,7 @@ competitors:
     linkedin_company_id: "87654321"
     linkedin_company_url: "https://www.linkedin.com/company/87654321/"
     reddit_discussion_keywords: ["review", "experience", "anyone used", "recommend", "worth it"]
+    twitter_handle: "techdeskpro"
 
   # --- Example: AI-native competitor (not on LinkedIn) ---
 
@@ -56,3 +63,4 @@ competitors:
     linkedin_company_url: null
     reddit_discussion_keywords: ["review", "experience", "anyone used", "recommend", "worth it"]
     reddit_include_subreddits: ["smallbusiness", "startups", "entrepreneur"]
+    facebook_page_id: "NovaBPO"

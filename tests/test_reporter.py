@@ -12,8 +12,8 @@ class ReporterTests(unittest.TestCase):
     def test_build_payload_summary_only_omits_competitor_sections(self):
         reports = [
             CompetitorReport(
-                competitor_name="Acme Support Co",
-                website_url="https://www.acmesupport.example.com",
+                competitor_name="Acme Corp",
+                website_url="https://acmecorp.example.com",
                 linkedin_ads_summary="• test",
             )
         ]
@@ -31,7 +31,7 @@ class ReporterTests(unittest.TestCase):
         ]
         joined = "\n".join(text_blocks)
         self.assertIn("*Executive Summary:*", joined)
-        self.assertNotIn("Acme Support Co", joined)
+        self.assertNotIn("Acme Corp", joined)
 
     def test_compact_model_summary_truncates_cleanly(self):
         raw = "• Managed services pricing changed significantly across enterprise bundles with multi-year minimum commitments and add-on overages."
@@ -61,8 +61,8 @@ class ReporterTests(unittest.TestCase):
 
     def test_payload_surfaces_linkedin_failures_instead_of_no_new_defaults(self):
         report = CompetitorReport(
-            competitor_name="Acme Support Co",
-            website_url="https://www.acmesupport.example.com",
+            competitor_name="Acme Corp",
+            website_url="https://acmecorp.example.com",
         )
         report.set_source_status("linkedin:ads", "failed", "auth wall")
         report.set_source_status("linkedin:organic", "failed", "checkpoint")

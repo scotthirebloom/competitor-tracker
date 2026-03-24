@@ -1,9 +1,11 @@
 import asyncio
+import json
 import logging
 import random
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -30,13 +32,22 @@ from .scrapers.website import (
     scrape_homepage,
     scrape_pricing,
 )
+from .scrapers.apidirect import (
+    ApiDirectClient,
+    ApiDirectPost,
+    BudgetExhaustedError,
+)
 from .summarizer import (
     summarize_executive_takeaways,
+    summarize_facebook_activity,
+    summarize_facebook_reviews,
     summarize_linkedin_organic_posts,
     summarize_new_ads,
     summarize_new_jobs,
     summarize_reddit_customer_discussions,
     summarize_pricing_research,
+    summarize_social_commentary,
+    summarize_twitter_activity,
     summarize_website_change,
 )
 
@@ -60,6 +71,17 @@ async def run_weekly(config: AppConfig) -> None:
     reports: list[CompetitorReport] = []
     linkedin_auth_failed = False
     linkedin_reauth_attempted = False
+    run_id = db.start_run(len(config.competitors))
+    run_start = time.monotonic()
+
+    # Create API Direct client if key is configured
+    apidirect_client: Optional[ApiDirectClient] = None
+    if config.apidirect_api_key:
+        apidirect_client = ApiDirectClient(
+            api_key=config.apidirect_api_key,
+            db=db,
+            monthly_limit=config.apidirect_monthly_limit,
+        )
 
     try:
         await send_run_started(
@@ -71,6 +93,7 @@ async def run_weekly(config: AppConfig) -> None:
         async with get_browser(headless=not config.debug) as browser:
             for i, competitor in enumerate(config.competitors):
                 logger.info("Processing %s ...", competitor.name)
+                comp_start = time.monotonic()
                 try:
                     report, linkedin_auth_failed, linkedin_reauth_attempted = await _process_competitor(
                         competitor,
@@ -82,9 +105,22 @@ async def run_weekly(config: AppConfig) -> None:
                         linkedin_auth_failed=linkedin_auth_failed,
                         linkedin_reauth_attempted=linkedin_reauth_attempted,
                         debug=config.debug,
+                        run_id=run_id,
+                        apidirect_client=apidirect_client,
                     )
                     reports.append(report)
-                    db.log_run(competitor.name, "success")
+                    db.log_run(
+                        competitor.name, "success",
+                        run_id=run_id,
+                        duration_seconds=time.monotonic() - comp_start,
+                        new_ads_count=report._new_ads_count,
+                        new_posts_count=report._new_posts_count,
+                        pages_changed_count=report._pages_changed_count,
+                        sources_json=json.dumps({
+                            "status": report.source_status,
+                            "notes": report.source_notes,
+                        }),
+                    )
                 except Exception as exc:
                     logger.error(
                         "Fatal error processing %s: %s",
@@ -95,7 +131,11 @@ async def run_weekly(config: AppConfig) -> None:
                         website_url=competitor.website,
                         error=str(exc),
                     ))
-                    db.log_run(competitor.name, "error", str(exc))
+                    db.log_run(
+                        competitor.name, "error", str(exc),
+                        run_id=run_id,
+                        duration_seconds=time.monotonic() - comp_start,
+                    )
 
                 # Pause between competitors — avoids hammering sites in rapid succession
                 if i < len(config.competitors) - 1:
@@ -125,6 +165,10 @@ async def run_weekly(config: AppConfig) -> None:
                 max_bullets=6,
             )
 
+        # Persist executive summary
+        if executive_summary:
+            db.save_summary(run_id, "_executive", "executive", executive_summary)
+
         await send_digest(
             reports,
             config.slack_webhook_url,
@@ -133,7 +177,31 @@ async def run_weekly(config: AppConfig) -> None:
             summary_only=True,
         )
 
+        db.finish_run(
+            run_id, "success",
+            executive_summary=executive_summary,
+            duration_seconds=time.monotonic() - run_start,
+        )
+
+        # Auto-prune old data
+        pruned_snaps = db.prune_old_snapshots(days=180)
+        pruned_ads = db.prune_old_ads(days=365)
+        if pruned_snaps or pruned_ads:
+            logger.info(
+                "Pruned %d old page snapshots and %d old ad snapshots",
+                pruned_snaps, pruned_ads,
+            )
+
+    except Exception:
+        db.finish_run(
+            run_id, "error",
+            duration_seconds=time.monotonic() - run_start,
+        )
+        raise
     finally:
+        if apidirect_client:
+            logger.info(apidirect_client.get_usage_summary())
+            await apidirect_client.close()
         db.close()
 
 
@@ -151,6 +219,8 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
     linkedin_reauth_attempted = False
 
     linkedin_competitors = [c for c in config.competitors if c.linkedin_company_id]
+    run_id = db.start_run(len(linkedin_competitors))
+    run_start = time.monotonic()
 
     try:
         await send_run_started(
@@ -170,6 +240,7 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
                 ),
                 summary_only=True,
             )
+            db.finish_run(run_id, "success", duration_seconds=time.monotonic() - run_start)
             return
 
         async with get_browser(headless=not config.debug) as browser:
@@ -195,8 +266,9 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
                             db=db,
                             report=report,
                             debug=config.debug,
+                            run_id=run_id,
                         )
-                    db.log_run(competitor.name, "success")
+                    db.log_run(competitor.name, "success", run_id=run_id)
                 except AuthExpiredError as exc:
                     logger.error("LinkedIn auth expired during recovery: %s", exc)
                     if not linkedin_reauth_attempted and await _attempt_linkedin_reauth_interactive():
@@ -218,8 +290,9 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
                                 db=db,
                                 report=report,
                                 debug=config.debug,
+                                run_id=run_id,
                             )
-                            db.log_run(competitor.name, "success")
+                            db.log_run(competitor.name, "success", run_id=run_id)
                         except Exception as retry_exc:
                             logger.warning(
                                 "LinkedIn recovery retry failed for %s: %s",
@@ -228,16 +301,16 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
                             )
                             linkedin_auth_failed = True
                             _set_linkedin_auth_warning(report)
-                            db.log_run(competitor.name, "error", str(retry_exc))
+                            db.log_run(competitor.name, "error", str(retry_exc), run_id=run_id)
                     else:
                         linkedin_reauth_attempted = True
                         linkedin_auth_failed = True
                         _set_linkedin_auth_warning(report)
-                        db.log_run(competitor.name, "error", str(exc))
+                        db.log_run(competitor.name, "error", str(exc), run_id=run_id)
                 except Exception as exc:
                     logger.warning("LinkedIn recovery error for %s: %s", competitor.name, exc)
                     report.error = f"LinkedIn recovery failed: {exc}"
-                    db.log_run(competitor.name, "error", str(exc))
+                    db.log_run(competitor.name, "error", str(exc), run_id=run_id)
 
                 reports.append(report)
 
@@ -271,6 +344,9 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
                 max_bullets=6,
             )
 
+        if executive_summary:
+            db.save_summary(run_id, "_executive", "executive", executive_summary)
+
         await send_digest(
             reports,
             config.slack_webhook_url,
@@ -278,6 +354,18 @@ async def run_linkedin_recovery(config: AppConfig) -> None:
             executive_summary=executive_summary,
             summary_only=True,
         )
+
+        db.finish_run(
+            run_id, "success",
+            executive_summary=executive_summary,
+            duration_seconds=time.monotonic() - run_start,
+        )
+    except Exception:
+        db.finish_run(
+            run_id, "error",
+            duration_seconds=time.monotonic() - run_start,
+        )
+        raise
     finally:
         db.close()
 
@@ -292,6 +380,8 @@ async def _process_competitor(
     linkedin_auth_failed: bool,
     linkedin_reauth_attempted: bool,
     debug: bool = False,
+    run_id: Optional[int] = None,
+    apidirect_client: Optional[ApiDirectClient] = None,
 ) -> tuple[CompetitorReport, bool, bool]:
     report = CompetitorReport(
         competitor_name=competitor.name,
@@ -333,7 +423,7 @@ async def _process_competitor(
                     if page_type == "pricing":
                         pricing_page_failed = True
                 else:
-                    await _handle_website_result(result, db, report)
+                    await _handle_website_result(result, db, report, run_id=run_id)
                     report.set_source_status(f"website:{page_type}", "ok")
                     if page_type == "pricing":
                         pricing_page_text = result.text
@@ -374,6 +464,7 @@ async def _process_competitor(
                 db,
                 report,
                 existing_pricing=pricing_page_text,
+                run_id=run_id,
             )
             report.set_source_status("reddit:pricing", "ok")
         except Exception as exc:
@@ -405,6 +496,7 @@ async def _process_competitor(
             competitor.name,
             db,
             report,
+            run_id=run_id,
         )
         report.set_source_status("reddit:discussion", "ok")
     except Exception as exc:
@@ -429,6 +521,7 @@ async def _process_competitor(
                 db=db,
                 report=report,
                 debug=debug,
+                run_id=run_id,
             )
         except AuthExpiredError as exc:
             logger.error("LinkedIn auth expired: %s", exc)
@@ -448,6 +541,7 @@ async def _process_competitor(
                         db=db,
                         report=report,
                         debug=debug,
+                        run_id=run_id,
                     )
                 except AuthExpiredError as retry_exc:
                     logger.error("LinkedIn auth still expired after re-auth: %s", retry_exc)
@@ -485,6 +579,184 @@ async def _process_competitor(
         report.set_source_status("linkedin:ads", "not_configured")
         report.set_source_status("linkedin:organic", "not_configured")
 
+    # --- API Direct: LinkedIn fallback ---
+    if apidirect_client and competitor.linkedin_company_url:
+        linkedin_ads_failed = report.source_status.get("linkedin:ads") in {"failed", "skipped"}
+        linkedin_organic_failed = report.source_status.get("linkedin:organic") in {"failed", "skipped"}
+        if (linkedin_ads_failed or linkedin_organic_failed) and not report.linkedin_organic_summary:
+            try:
+                li_posts = await apidirect_client.get_linkedin_company_posts(
+                    competitor.linkedin_company_url,
+                )
+                await _handle_apidirect_results(
+                    li_posts, "apidirect_linkedin", competitor.name, db, report,
+                    summary_attr="linkedin_organic_summary",
+                    summary_type="linkedin_organic",
+                    summarize_fn=lambda posts: summarize_linkedin_organic_posts(
+                        competitor.name,
+                        [{"post_text": p.text, "posted_label": p.date, "post_url": p.url} for p in posts],
+                    ),
+                    run_id=run_id,
+                    summary_prefix="*LinkedIn (via API Direct)*\n",
+                )
+                report.set_source_status("linkedin:apidirect_fallback", "ok")
+            except BudgetExhaustedError:
+                report.set_source_status("linkedin:apidirect_fallback", "skipped", "monthly budget exhausted")
+            except Exception as exc:
+                logger.warning("API Direct LinkedIn fallback error for %s: %s", competitor.name, exc)
+                report.set_source_status("linkedin:apidirect_fallback", "failed", _truncate_note(str(exc)))
+
+    # --- API Direct: Reddit fallback ---
+    # Trigger when native Reddit explicitly failed/skipped, OR when it ran
+    # but produced no summaries (e.g. 403 wall returning 0 posts marked "ok").
+    if apidirect_client:
+        reddit_pricing_failed = report.source_status.get("reddit:pricing") in {"failed", "skipped"}
+        reddit_discussion_failed = report.source_status.get("reddit:discussion") in {"failed", "skipped"}
+        reddit_returned_nothing = (
+            not report.pricing_research_summary
+            and not report.reddit_discussion_summary
+        )
+        if (reddit_pricing_failed or reddit_discussion_failed or reddit_returned_nothing) and not report.reddit_discussion_summary:
+            try:
+                search_term = competitor.reddit_search or competitor.name
+                reddit_posts = await apidirect_client.search_reddit(search_term)
+                await _handle_apidirect_results(
+                    reddit_posts, "apidirect_reddit", competitor.name, db, report,
+                    summary_attr="reddit_discussion_summary",
+                    summary_type="reddit_discussion",
+                    summarize_fn=lambda posts: summarize_reddit_customer_discussions(
+                        competitor.name,
+                        [_apidirect_to_reddit_post(p) for p in posts],
+                    ),
+                    run_id=run_id,
+                    summary_prefix="*Reddit (via API Direct)*\n",
+                )
+                report.set_source_status("reddit:apidirect_fallback", "ok")
+            except BudgetExhaustedError:
+                report.set_source_status("reddit:apidirect_fallback", "skipped", "monthly budget exhausted")
+            except Exception as exc:
+                logger.warning("API Direct Reddit fallback error for %s: %s", competitor.name, exc)
+                report.set_source_status("reddit:apidirect_fallback", "failed", _truncate_note(str(exc)))
+
+    # --- API Direct: Twitter ---
+    if apidirect_client and competitor.twitter_handle:
+        # Competitor's own tweets
+        try:
+            tweets = await apidirect_client.get_twitter_user_tweets(competitor.twitter_handle)
+            await _handle_apidirect_results(
+                tweets, "twitter", competitor.name, db, report,
+                summary_attr="twitter_summary",
+                summary_type="twitter_activity",
+                summarize_fn=lambda posts: summarize_twitter_activity(
+                    competitor.name,
+                    [{"title": p.title, "text": p.text, "url": p.url, "date": p.date, "engagement": p.engagement} for p in posts],
+                ),
+                run_id=run_id,
+            )
+            report.set_source_status("twitter:activity", "ok")
+        except BudgetExhaustedError:
+            report.set_source_status("twitter:activity", "skipped", "monthly budget exhausted")
+        except Exception as exc:
+            logger.warning("API Direct Twitter error for %s: %s", competitor.name, exc)
+            report.set_source_status("twitter:activity", "failed", _truncate_note(str(exc)))
+
+        # Twitter social commentary (keyword search)
+        try:
+            keywords = competitor.apidirect_keywords or [competitor.reddit_search or competitor.name]
+            tw_commentary: list[ApiDirectPost] = []
+            for kw in keywords[:2]:  # cap at 2 keyword searches to conserve budget
+                results = await apidirect_client.search_twitter(kw)
+                tw_commentary.extend(results)
+            # Filter out competitor's own tweets
+            tw_commentary = [
+                p for p in tw_commentary
+                if p.author.lower() != (competitor.twitter_handle or "").lower()
+            ]
+            await _handle_apidirect_results(
+                tw_commentary, "twitter_social", competitor.name, db, report,
+                summary_attr="twitter_social_summary",
+                summary_type="twitter_social",
+                summarize_fn=lambda posts: summarize_social_commentary(
+                    competitor.name,
+                    "Twitter",
+                    [{"title": p.title, "text": p.text, "url": p.url, "date": p.date, "author": p.author} for p in posts],
+                ),
+                run_id=run_id,
+            )
+            report.set_source_status("twitter:social", "ok")
+        except BudgetExhaustedError:
+            report.set_source_status("twitter:social", "skipped", "monthly budget exhausted")
+        except Exception as exc:
+            logger.warning("API Direct Twitter commentary error for %s: %s", competitor.name, exc)
+            report.set_source_status("twitter:social", "failed", _truncate_note(str(exc)))
+
+    # --- API Direct: Facebook ---
+    if apidirect_client and competitor.facebook_page_id:
+        # Competitor's own FB posts
+        try:
+            fb_posts = await apidirect_client.get_facebook_page_posts(competitor.facebook_page_id)
+            await _handle_apidirect_results(
+                fb_posts, "facebook", competitor.name, db, report,
+                summary_attr="facebook_summary",
+                summary_type="facebook_activity",
+                summarize_fn=lambda posts: summarize_facebook_activity(
+                    competitor.name,
+                    [{"title": p.title, "text": p.text, "url": p.url, "date": p.date, "engagement": p.engagement} for p in posts],
+                ),
+                run_id=run_id,
+            )
+            report.set_source_status("facebook:posts", "ok")
+        except BudgetExhaustedError:
+            report.set_source_status("facebook:posts", "skipped", "monthly budget exhausted")
+        except Exception as exc:
+            logger.warning("API Direct Facebook posts error for %s: %s", competitor.name, exc)
+            report.set_source_status("facebook:posts", "failed", _truncate_note(str(exc)))
+
+        # Facebook reviews
+        try:
+            fb_reviews = await apidirect_client.get_facebook_page_reviews(competitor.facebook_page_id)
+            await _handle_apidirect_results(
+                fb_reviews, "facebook_review", competitor.name, db, report,
+                summary_attr="facebook_reviews_summary",
+                summary_type="facebook_reviews",
+                summarize_fn=lambda posts: summarize_facebook_reviews(
+                    competitor.name,
+                    [{"title": p.title, "text": p.text, "url": p.url, "date": p.date} for p in posts],
+                ),
+                run_id=run_id,
+            )
+            report.set_source_status("facebook:reviews", "ok")
+        except BudgetExhaustedError:
+            report.set_source_status("facebook:reviews", "skipped", "monthly budget exhausted")
+        except Exception as exc:
+            logger.warning("API Direct Facebook reviews error for %s: %s", competitor.name, exc)
+            report.set_source_status("facebook:reviews", "failed", _truncate_note(str(exc)))
+
+        # Facebook social commentary (keyword search)
+        try:
+            keywords = competitor.apidirect_keywords or [competitor.reddit_search or competitor.name]
+            fb_commentary: list[ApiDirectPost] = []
+            for kw in keywords[:2]:
+                results = await apidirect_client.search_facebook(kw)
+                fb_commentary.extend(results)
+            await _handle_apidirect_results(
+                fb_commentary, "facebook_social", competitor.name, db, report,
+                summary_attr="facebook_social_summary",
+                summary_type="facebook_social",
+                summarize_fn=lambda posts: summarize_social_commentary(
+                    competitor.name,
+                    "Facebook",
+                    [{"title": p.title, "text": p.text, "url": p.url, "date": p.date, "author": p.author} for p in posts],
+                ),
+                run_id=run_id,
+            )
+            report.set_source_status("facebook:social", "ok")
+        except BudgetExhaustedError:
+            report.set_source_status("facebook:social", "skipped", "monthly budget exhausted")
+        except Exception as exc:
+            logger.warning("API Direct Facebook commentary error for %s: %s", competitor.name, exc)
+            report.set_source_status("facebook:social", "failed", _truncate_note(str(exc)))
+
     return report, linkedin_auth_failed, linkedin_reauth_attempted
 
 
@@ -494,6 +766,7 @@ async def _handle_reddit_pricing(
     db: Database,
     report: CompetitorReport,
     existing_pricing: Optional[str],
+    run_id: Optional[int] = None,
 ) -> None:
     """
     Dedup Reddit posts, summarize new ones via Gemini, attach to report.
@@ -511,6 +784,9 @@ async def _handle_reddit_pricing(
             existing_pricing=existing_pricing,
         )
         report.pricing_research_summary = summary
+        report._new_posts_count += len(new_posts)
+        if run_id is not None:
+            db.save_summary(run_id, competitor_name, "pricing_research", summary)
 
     # Store all posts so they're known on future runs (dedup)
     now = _now()
@@ -533,6 +809,7 @@ async def _handle_reddit_discussions(
     competitor_name: str,
     db: Database,
     report: CompetitorReport,
+    run_id: Optional[int] = None,
 ) -> None:
     """
     Dedup Reddit customer/prospect threads, summarize new ones, and store snapshots.
@@ -549,6 +826,9 @@ async def _handle_reddit_discussions(
             new_posts,
         )
         report.reddit_discussion_summary = summary
+        report._new_posts_count += len(new_posts)
+        if run_id is not None:
+            db.save_summary(run_id, competitor_name, "reddit_discussion", summary)
 
     now = _now()
     db.upsert_ads([
@@ -565,6 +845,61 @@ async def _handle_reddit_discussions(
     ])
 
 
+async def _handle_apidirect_results(
+    posts: list[ApiDirectPost],
+    platform: str,
+    competitor_name: str,
+    db: Database,
+    report: CompetitorReport,
+    summary_attr: str,
+    summary_type: str,
+    summarize_fn,
+    run_id: Optional[int] = None,
+    summary_prefix: str = "",
+) -> None:
+    """Generic handler for API Direct results — dedup, summarize, store."""
+    if not posts:
+        return
+
+    known_ids = db.get_known_ad_ids(competitor_name, platform)
+    new_posts = [p for p in posts if p.post_id not in known_ids]
+
+    if new_posts:
+        summary = await summarize_fn(new_posts)
+        full_summary = f"{summary_prefix}{summary}" if summary_prefix else summary
+        setattr(report, summary_attr, full_summary)
+        report._new_posts_count += len(new_posts)
+        if run_id is not None:
+            db.save_summary(run_id, competitor_name, summary_type, full_summary)
+
+    now = _now()
+    db.upsert_ads([
+        AdSnapshot(
+            competitor_name=competitor_name,
+            platform=platform,
+            ad_id=p.post_id,
+            ad_text=f"{p.title}\n{p.text[:700]}",
+            creative_desc=p.url,
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+        for p in posts
+    ])
+
+
+def _apidirect_to_reddit_post(post: ApiDirectPost) -> RedditPost:
+    """Convert an ApiDirectPost to a RedditPost for reuse in existing summarizers."""
+    return RedditPost(
+        post_id=post.post_id,
+        title=post.title,
+        text=post.text,
+        url=post.url,
+        subreddit="unknown",
+        date=post.date,
+        comments=[],
+    )
+
+
 def _build_reddit_ad_text(post: RedditPost) -> str:
     body = post.text[:700]
     comments = post.comments[:4]
@@ -579,6 +914,7 @@ async def _handle_website_result(
     result: WebsiteResult,
     db: Database,
     report: CompetitorReport,
+    run_id: Optional[int] = None,
 ) -> None:
     new_hash = Database.hash_content(result.text)
     prev = db.get_last_snapshot(result.competitor_name, result.page_type)
@@ -599,6 +935,12 @@ async def _handle_website_result(
             if jobs_summary:
                 summary = f"{summary}\n\n_New jobs:_ {jobs_summary}"
         setattr(report, f"{result.page_type}_change", summary)
+        report._pages_changed_count += 1
+        if run_id is not None:
+            db.save_summary(
+                run_id, result.competitor_name,
+                f"{result.page_type}_change", summary,
+            )
 
     elif changed and prev is None:
         # First run — no diff available, just record
@@ -625,6 +967,7 @@ async def _handle_ad_results(
     competitor_name: str,
     db: Database,
     report: CompetitorReport,
+    run_id: Optional[int] = None,
 ) -> None:
     if not ads:
         return
@@ -645,6 +988,9 @@ async def _handle_ad_results(
         summary = await summarize_new_ads(competitor_name, platform, ads_for_summary)
         prefix = f"*{len(new_ads)} new ad(s) detected*\n"
         report.linkedin_ads_summary = prefix + summary
+        report._new_ads_count += len(new_ads)
+        if run_id is not None:
+            db.save_summary(run_id, competitor_name, "linkedin_ads", prefix + summary)
 
     # Upsert all seen ads to update last_seen_at
     now = _now()
@@ -668,6 +1014,7 @@ async def _handle_linkedin_organic_results(
     competitor_name: str,
     db: Database,
     report: CompetitorReport,
+    run_id: Optional[int] = None,
 ) -> None:
     if not posts:
         return
@@ -685,7 +1032,11 @@ async def _handle_linkedin_organic_results(
             for p in new_posts
         ]
         summary = await summarize_linkedin_organic_posts(competitor_name, posts_for_summary)
-        report.linkedin_organic_summary = f"*{len(new_posts)} new post(s) in last 7 days*\n{summary}"
+        full_summary = f"*{len(new_posts)} new post(s) in last 7 days*\n{summary}"
+        report.linkedin_organic_summary = full_summary
+        report._new_posts_count += len(new_posts)
+        if run_id is not None:
+            db.save_summary(run_id, competitor_name, "linkedin_organic", full_summary)
 
     now = _now()
     db.upsert_ads([
@@ -724,6 +1075,11 @@ async def _generate_executive_summary(reports: list[CompetitorReport]) -> Option
                 "reddit_discussion_summary": report.reddit_discussion_summary,
                 "linkedin_ads_summary": report.linkedin_ads_summary,
                 "linkedin_organic_summary": report.linkedin_organic_summary,
+                "twitter_summary": report.twitter_summary,
+                "twitter_social_summary": report.twitter_social_summary,
+                "facebook_summary": report.facebook_summary,
+                "facebook_reviews_summary": report.facebook_reviews_summary,
+                "facebook_social_summary": report.facebook_social_summary,
                 "coverage_summary": _coverage_summary(report),
                 "error": report.error,
             }
@@ -782,6 +1138,7 @@ async def _collect_linkedin_signals(
     db: Database,
     report: CompetitorReport,
     debug: bool,
+    run_id: Optional[int] = None,
 ) -> None:
     try:
         li_ads = await scrape_linkedin_ads(
@@ -802,7 +1159,7 @@ async def _collect_linkedin_signals(
             _truncate_note(str(exc)),
         )
     else:
-        await _handle_ad_results(li_ads, "linkedin", competitor_name, db, report)
+        await _handle_ad_results(li_ads, "linkedin", competitor_name, db, report, run_id=run_id)
         report.set_source_status("linkedin:ads", "ok")
 
     # Conservative pacing between LinkedIn endpoints to reduce throttling.
@@ -834,6 +1191,7 @@ async def _collect_linkedin_signals(
             competitor_name,
             db,
             report,
+            run_id=run_id,
         )
         report.set_source_status("linkedin:organic", "ok")
 
@@ -912,6 +1270,8 @@ def _build_coverage_bullet(reports: list[CompetitorReport]) -> Optional[str]:
             ("website", source_counts.get("website", 0)),
             ("Reddit", source_counts.get("reddit", 0)),
             ("LinkedIn", source_counts.get("linkedin", 0)),
+            ("Twitter", source_counts.get("twitter", 0)),
+            ("Facebook", source_counts.get("facebook", 0)),
         )
         if count
     ]
@@ -925,8 +1285,15 @@ def _source_display_name(source: str) -> str:
     labels = {
         "linkedin:ads": "LinkedIn ads",
         "linkedin:organic": "LinkedIn organic",
+        "linkedin:apidirect_fallback": "LinkedIn (API Direct)",
         "reddit:pricing": "Reddit pricing intel",
         "reddit:discussion": "Reddit customer voice",
+        "reddit:apidirect_fallback": "Reddit (API Direct)",
+        "twitter:activity": "Twitter",
+        "twitter:social": "Twitter commentary",
+        "facebook:posts": "Facebook",
+        "facebook:reviews": "Facebook reviews",
+        "facebook:social": "Facebook commentary",
         "website:homepage": "Homepage",
         "website:blog": "Blog",
         "website:pricing": "Pricing page",

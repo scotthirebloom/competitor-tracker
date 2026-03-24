@@ -23,9 +23,18 @@ class CompetitorReport:
     linkedin_organic_summary: Optional[str] = None
     pricing_research_summary: Optional[str] = None
     reddit_discussion_summary: Optional[str] = None
+    twitter_summary: Optional[str] = None
+    twitter_social_summary: Optional[str] = None
+    facebook_summary: Optional[str] = None
+    facebook_reviews_summary: Optional[str] = None
+    facebook_social_summary: Optional[str] = None
     error: Optional[str] = None
     source_status: dict[str, str] = field(default_factory=dict)
     source_notes: dict[str, str] = field(default_factory=dict)
+    # Counters for run_log enrichment (not displayed in Slack)
+    _new_ads_count: int = 0
+    _new_posts_count: int = 0
+    _pages_changed_count: int = 0
 
     def set_source_status(
         self,
@@ -329,6 +338,85 @@ def _competitor_blocks(report: CompetitorReport) -> list[dict]:
             },
         })
 
+    # Twitter — competitor's own tweets
+    if report.twitter_summary:
+        compact_twitter = _compact_model_summary(
+            report.twitter_summary,
+            max_bullets=3,
+            max_bullet_chars=220,
+        )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _truncate_block(f"*Twitter:*\n{compact_twitter}"),
+            },
+        })
+
+    # Twitter — third-party commentary
+    if report.twitter_social_summary:
+        compact_tw_social = _compact_model_summary(
+            report.twitter_social_summary,
+            max_bullets=3,
+            max_bullet_chars=220,
+        )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _truncate_block(
+                    f"*Twitter Commentary (third-party):*\n{compact_tw_social}"
+                ),
+            },
+        })
+
+    # Facebook — competitor's own posts
+    if report.facebook_summary:
+        compact_fb = _compact_model_summary(
+            report.facebook_summary,
+            max_bullets=3,
+            max_bullet_chars=220,
+        )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _truncate_block(f"*Facebook:*\n{compact_fb}"),
+            },
+        })
+
+    # Facebook reviews
+    if report.facebook_reviews_summary:
+        compact_fb_reviews = _compact_model_summary(
+            report.facebook_reviews_summary,
+            max_bullets=3,
+            max_bullet_chars=220,
+        )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _truncate_block(f"*Facebook Reviews:*\n{compact_fb_reviews}"),
+            },
+        })
+
+    # Facebook — third-party commentary
+    if report.facebook_social_summary:
+        compact_fb_social = _compact_model_summary(
+            report.facebook_social_summary,
+            max_bullets=3,
+            max_bullet_chars=220,
+        )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _truncate_block(
+                    f"*Facebook Commentary (third-party):*\n{compact_fb_social}"
+                ),
+            },
+        })
+
     blocks.append({"type": "divider"})
     return blocks
 
@@ -378,8 +466,15 @@ def _source_display_name(source: str) -> str:
     labels = {
         "linkedin:ads": "LinkedIn Ads",
         "linkedin:organic": "LinkedIn Organic",
+        "linkedin:apidirect_fallback": "LinkedIn (API Direct)",
         "reddit:pricing": "Pricing Intel (Reddit)",
         "reddit:discussion": "Reddit Customer Voice",
+        "reddit:apidirect_fallback": "Reddit (API Direct)",
+        "twitter:activity": "Twitter",
+        "twitter:social": "Twitter Commentary",
+        "facebook:posts": "Facebook",
+        "facebook:reviews": "Facebook Reviews",
+        "facebook:social": "Facebook Commentary",
         "website:homepage": "Homepage",
         "website:blog": "Blog",
         "website:pricing": "Pricing",

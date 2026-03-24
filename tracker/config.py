@@ -28,6 +28,9 @@ class CompetitorConfig:
     reddit_discussion_keywords: list[str] = field(default_factory=list)
     reddit_include_subreddits: list[str] = field(default_factory=list)
     reddit_exclude_subreddits: list[str] = field(default_factory=list)
+    facebook_page_id: Optional[str] = None
+    twitter_handle: Optional[str] = None
+    apidirect_keywords: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -39,6 +42,8 @@ class AppConfig:
     session_path: Path
     linkedin_username: Optional[str] = None
     linkedin_password: Optional[str] = None
+    apidirect_api_key: Optional[str] = None
+    apidirect_monthly_limit: int = 50  # free tier: 50 requests per endpoint per month
     debug: bool = False
 
 
@@ -65,6 +70,9 @@ def load_config(yaml_path: Path) -> AppConfig:
     if not competitors:
         raise ValueError(f"No competitors defined in {yaml_path}")
 
+    apidirect_api_key = os.getenv("APIDIRECT_API_KEY")
+    apidirect_monthly_limit = int(os.getenv("APIDIRECT_MONTHLY_LIMIT", "50"))
+
     return AppConfig(
         gemini_api_key=anthropic_key,
         slack_webhook_url=slack_url,
@@ -73,6 +81,8 @@ def load_config(yaml_path: Path) -> AppConfig:
         session_path=_PROJECT_ROOT / "data" / "linkedin_session.json",
         linkedin_username=linkedin_username,
         linkedin_password=linkedin_password,
+        apidirect_api_key=apidirect_api_key,
+        apidirect_monthly_limit=apidirect_monthly_limit,
     )
 
 
@@ -96,6 +106,9 @@ def _load_competitors(raw: list[dict]) -> list[CompetitorConfig]:
             reddit_discussion_keywords=_as_str_list(entry.get("reddit_discussion_keywords")),
             reddit_include_subreddits=_as_str_list(entry.get("reddit_include_subreddits")),
             reddit_exclude_subreddits=_as_str_list(entry.get("reddit_exclude_subreddits")),
+            facebook_page_id=entry.get("facebook_page_id"),
+            twitter_handle=entry.get("twitter_handle"),
+            apidirect_keywords=_as_str_list(entry.get("apidirect_keywords")),
         ))
     return result
 
